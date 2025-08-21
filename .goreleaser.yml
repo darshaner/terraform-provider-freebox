@@ -1,0 +1,30 @@
+project_name: terraform-provider-freebox
+release:
+  github:
+    owner: darshaner
+    name: terraform-provider-freebox
+
+builds:
+  - env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    binary: terraform-provider-freebox
+
+archives:
+  - format: zip
+    files:
+      - none*
+
+checksum:
+  name_template: "checksums.txt"
+
+signs:
+  - artifacts: checksum
+    args: ["--batch", "-u", "{{ .Env.GPG_FINGERPRINT }}", "--detach-sign", "--armor", "{{ .ArtifactPath }}"]
+
