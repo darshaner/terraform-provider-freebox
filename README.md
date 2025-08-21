@@ -25,7 +25,7 @@ terraform {
 
 provider "freebox" {
   app_token = var.freebox_app_token
-  # base_url = "http://mafreebox.freebox.fr/api/v8" # override if needed
+  # base_url = "http://mafreebox.freebox.fr/api/v15" # override if needed
 }
 ```
 
