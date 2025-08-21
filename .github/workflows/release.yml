@@ -8,6 +8,8 @@ on:
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:   # 👈 add this block
+      contents: write   # allow creating GitHub releases
     steps:
       - name: Checkout
         uses: actions/checkout@v4
