@@ -153,6 +153,7 @@ func (p *freeboxProvider) Resources(_ context.Context) []func() resource.Resourc
 	return []func() resource.Resource{
 		NewDhcpLeaseResource,
 		NewDhcpConfigResource,
+		NewPortForwardingResource,
 	}
 }
 
@@ -160,6 +161,7 @@ func (p *freeboxProvider) DataSources(_ context.Context) []func() datasource.Dat
 	return []func() datasource.DataSource{
 		NewDhcpLeasesDataSource,
 		NewDhcpConfigDataSource,
+		NewPortForwardingsDataSource,
 	}
 }
 

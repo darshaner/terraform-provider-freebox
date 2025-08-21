@@ -1,4 +1,4 @@
-# Freebox Terraform Provider (v1.0.0)
+# Freebox Terraform Provider
 
 Manage Freebox DHCP **static leases** and **DHCP server configuration** with Terraform.
 
