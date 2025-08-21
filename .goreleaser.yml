@@ -18,6 +18,7 @@ builds:
 
 archives:
   - format: zip
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
       - none*
 
@@ -26,4 +27,13 @@ checksum:
 
 signs:
   - artifacts: checksum
-    args: ["--batch", "-u", "{{ .Env.GPG_FINGERPRINT }}", "--detach-sign", "--armor"]
+    signature: "${artifact}.sig"
+    args:
+      [
+        "--batch",
+        "-u", "{{ .Env.GPG_FINGERPRINT }}",
+        "--detach-sign",
+        "--armor",
+        "--output", "${signature}",
+        "${artifact}"
+      ]
