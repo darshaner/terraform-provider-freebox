@@ -10,6 +10,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
@@ -65,11 +66,13 @@ func (r *PortForwardingResource) Schema(_ context.Context, _ resource.SchemaRequ
 				Computed: true,
 			},
 			"enabled": schema.BoolAttribute{
-				Required: true,
+				Optional: true,
+				Computed: true,
 				Default:  booldefault.StaticBool(true),
 			},
 			"ip_proto": schema.StringAttribute{
-				Required: true,
+				Computed: true,
+				Default:  stringdefault.StaticString("tcp"),
 			},
 			"wan_port_start": schema.Int64Attribute{
 				Required: true,
@@ -86,6 +89,7 @@ func (r *PortForwardingResource) Schema(_ context.Context, _ resource.SchemaRequ
 			"src_ip": schema.StringAttribute{
 				Optional: true,
 				Computed: true,
+				Default:  stringdefault.StaticString("0.0.0.0"),
 			},
 			"comment": schema.StringAttribute{
 				Optional: true,
