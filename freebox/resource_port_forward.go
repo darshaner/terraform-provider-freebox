@@ -1,39 +1,54 @@
+// Manage Port Forwarding rules (API v8+): /fw/redir/
 package freebox
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	rschema "github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
-// ----------------------------
-// API Model
-// ----------------------------
-type PortForwardingConfig struct {
-	ID           int    `json:"id"`
-	Enabled      bool   `json:"enabled"`
-	IpProto      string `json:"ip_proto"`
-	WanPortStart int    `json:"wan_port_start"`
-	WanPortEnd   int    `json:"wan_port_end"`
-	LanIP        string `json:"lan_ip"`
-	LanPort      int    `json:"lan_port"`
-	SrcIP        string `json:"src_ip"`
-	Comment      string `json:"comment"`
-	Hostname     string `json:"hostname"`
+// Ensure interfaces
+var (
+	_ resource.Resource                = &portForwardResource{}
+	_ resource.ResourceWithConfigure   = &portForwardResource{}
+	_ resource.ResourceWithImportState = &portForwardResource{}
+)
+
+func NewPortForwardingResource() resource.Resource { return &portForwardResource{} }
+
+// ---------- API models ----------
+
+type apiPortForward struct {
+	ID           int             `json:"id,omitempty"` // omitempty so create doesn't send 0
+	Enabled      bool            `json:"enabled"`
+	IpProto      string          `json:"ip_proto"`       // "tcp" | "udp"
+	WanPortStart int             `json:"wan_port_start"` // required
+	WanPortEnd   int             `json:"wan_port_end"`   // required
+	LanIP        string          `json:"lan_ip"`         // required
+	LanPort      int             `json:"lan_port"`       // required
+	SrcIP        string          `json:"src_ip"`         // default "0.0.0.0"
+	Comment      string          `json:"comment,omitempty"`
+	Hostname     string          `json:"hostname,omitempty"` // read-only
+	Host         json.RawMessage `json:"host,omitempty"`     // read-only
 }
 
-// ----------------------------
-// Terraform Resource Model
-// ----------------------------
-type PortForwardingModel struct {
+// NOTE: apiEnvelope[T] is defined elsewhere in this package.
+
+// ---------- TF model ----------
+
+type pfModel struct {
 	ID           types.Int64  `tfsdk:"id"`
 	Enabled      types.Bool   `tfsdk:"enabled"`
 	IpProto      types.String `tfsdk:"ip_proto"`
@@ -46,208 +61,283 @@ type PortForwardingModel struct {
 	Hostname     types.String `tfsdk:"hostname"`
 }
 
-// ----------------------------
-// Resource Definition
-// ----------------------------
-type PortForwardingResource struct{}
+type portForwardResource struct{ client *Client }
 
-func NewPortForwardingResource() resource.Resource {
-	return &PortForwardingResource{}
+// ---------- Resource wiring ----------
+
+func (r *portForwardResource) Metadata(_ context.Context, _ resource.MetadataRequest, resp *resource.MetadataResponse) {
+	resp.TypeName = "freebox_port_forward"
 }
 
-func (r *PortForwardingResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
-	resp.TypeName = req.ProviderTypeName + "_port_forward"
-}
-
-func (r *PortForwardingResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
-	resp.Schema = schema.Schema{
-		Attributes: map[string]schema.Attribute{
-			"id": schema.Int64Attribute{
-				Computed: true,
+func (r *portForwardResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
+	resp.Schema = rschema.Schema{
+		Description: "Manage Freebox Port Forwarding rules (fw/redir).",
+		Attributes: map[string]rschema.Attribute{
+			"id": rschema.Int64Attribute{
+				Computed:    true,
+				Description: "Port forwarding rule ID (assigned by Freebox).",
+				// We keep Update robust by reading ID from state; no plan modifier required.
 			},
-			"enabled": schema.BoolAttribute{
-				Optional: true,
-				Computed: true,
-				Default:  booldefault.StaticBool(true),
+			"enabled": rschema.BoolAttribute{
+				Optional:    true,
+				Computed:    true,
+				Default:     booldefault.StaticBool(true),
+				Description: "Enable/disable this forwarding rule.",
 			},
-			"ip_proto": schema.StringAttribute{
-				Computed: true,
-				Default:  stringdefault.StaticString("tcp"),
+			"ip_proto": rschema.StringAttribute{
+				Optional:    true,
+				Computed:    true,
+				Default:     stringdefault.StaticString("tcp"),
+				Description: `IP protocol ("tcp" or "udp").`,
 			},
-			"wan_port_start": schema.Int64Attribute{
-				Required: true,
+			"wan_port_start": rschema.Int64Attribute{
+				Required:    true,
+				Description: "External (WAN) start port.",
 			},
-			"wan_port_end": schema.Int64Attribute{
-				Required: true,
+			"wan_port_end": rschema.Int64Attribute{
+				Required:    true,
+				Description: "External (WAN) end port.",
 			},
-			"lan_ip": schema.StringAttribute{
-				Required: true,
+			"lan_ip": rschema.StringAttribute{
+				Required:    true,
+				Description: "Target LAN IP.",
 			},
-			"lan_port": schema.Int64Attribute{
-				Required: true,
+			"lan_port": rschema.Int64Attribute{
+				Required:    true,
+				Description: "Target LAN start port (end is lan_port + wan_port_end - wan_port_start).",
 			},
-			"src_ip": schema.StringAttribute{
-				Optional: true,
-				Computed: true,
-				Default:  stringdefault.StaticString("0.0.0.0"),
+			"src_ip": rschema.StringAttribute{
+				Optional:    true,
+				Computed:    true,
+				Default:     stringdefault.StaticString("0.0.0.0"),
+				Description: "Source IP filter. Use 0.0.0.0 for any source.",
 			},
-			"comment": schema.StringAttribute{
-				Optional: true,
+			"comment": rschema.StringAttribute{
+				Optional:    true,
+				Description: "Optional comment.",
 			},
-			"hostname": schema.StringAttribute{
-				Computed: true,
+			"hostname": rschema.StringAttribute{
+				Computed:    true,
+				Description: "Resolved target hostname (read-only).",
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
 			},
 		},
 	}
 }
 
-// ----------------------------
-// CRUD Operations
-// ----------------------------
-func (r *PortForwardingResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
-	var plan PortForwardingModel
+func (r *portForwardResource) Configure(_ context.Context, req resource.ConfigureRequest, _ *resource.ConfigureResponse) {
+	if req.ProviderData != nil {
+		r.client = req.ProviderData.(*Client)
+	}
+}
+
+// ---------- CRUD ----------
+
+func (r *portForwardResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
+	if r.client == nil {
+		resp.Diagnostics.AddError("Client not configured", "Provider client is nil")
+		return
+	}
+
+	var plan pfModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	payload := map[string]interface{}{
-		"enabled":        plan.Enabled.ValueBool(),
-		"ip_proto":       plan.IpProto.ValueString(),
-		"wan_port_start": plan.WanPortStart.ValueInt64(),
-		"wan_port_end":   plan.WanPortEnd.ValueInt64(),
-		"lan_ip":         plan.LanIP.ValueString(),
-		"lan_port":       plan.LanPort.ValueInt64(),
-		"src_ip":         plan.SrcIP.ValueString(),
-		"comment":        plan.Comment.ValueString(),
+	payload := apiPortForward{
+		Enabled:      plan.Enabled.ValueBool(),
+		IpProto:      plan.IpProto.ValueString(),
+		WanPortStart: int(plan.WanPortStart.ValueInt64()),
+		WanPortEnd:   int(plan.WanPortEnd.ValueInt64()),
+		LanIP:        plan.LanIP.ValueString(),
+		LanPort:      int(plan.LanPort.ValueInt64()),
+		SrcIP:        plan.SrcIP.ValueString(),
+		Comment:      plan.Comment.ValueString(),
 	}
+	b, _ := json.Marshal(payload)
 
-	body, _ := json.Marshal(payload)
-	url := "http://mafreebox.freebox.fr/api/v8/fw/redir/"
-	res, err := fbClient.DoRequest(http.MethodPost, url, body)
+	hreq, _ := r.client.newRequest(ctx, http.MethodPost, "/fw/redir/", bytes.NewBuffer(b))
+	hres, err := r.client.http.Do(hreq)
 	if err != nil {
-		resp.Diagnostics.AddError("API error", fmt.Sprintf("Failed creating port forward: %s", err))
+		resp.Diagnostics.AddError("API error", err.Error())
 		return
 	}
-	defer res.Body.Close()
-	raw, _ := ioutil.ReadAll(res.Body)
+	defer hres.Body.Close()
 
-	var result struct {
-		Success bool                 `json:"success"`
-		Result  PortForwardingConfig `json:"result"`
+	var env apiEnvelope[apiPortForward]
+	_ = json.NewDecoder(hres.Body).Decode(&env)
+	if hres.StatusCode != http.StatusOK && hres.StatusCode != http.StatusCreated {
+		resp.Diagnostics.AddError("API error", fmt.Sprintf("status %d (msg=%s, code=%s)", hres.StatusCode, env.Msg, env.ErrorCode))
+		return
 	}
-	_ = json.Unmarshal(raw, &result)
-	if !result.Success {
-		resp.Diagnostics.AddError("API error", fmt.Sprintf("Create failed: %s", string(raw)))
+	if !env.Success {
+		resp.Diagnostics.AddError("API error", fmt.Sprintf("success=false (msg=%s, code=%s)", env.Msg, env.ErrorCode))
 		return
 	}
 
-	plan.ID = types.Int64Value(int64(result.Result.ID))
-	plan.Hostname = types.StringValue(result.Result.Hostname)
-
-	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
+	resp.Diagnostics.Append(resp.State.Set(ctx, toPFState(env.Result))...)
 }
 
-func (r *PortForwardingResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
-	var state PortForwardingModel
+func (r *portForwardResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
+	if r.client == nil {
+		resp.Diagnostics.AddError("Client not configured", "Provider client is nil")
+		return
+	}
+
+	var state pfModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
-
-	url := fmt.Sprintf("http://mafreebox.freebox.fr/api/v8/fw/redir/%d", state.ID.ValueInt64())
-	res, err := fbClient.DoRequest(http.MethodGet, url, nil)
-	if err != nil {
-		resp.Diagnostics.AddError("API error", fmt.Sprintf("Failed reading port forward: %s", err))
-		return
-	}
-	defer res.Body.Close()
-	raw, _ := ioutil.ReadAll(res.Body)
-
-	var result struct {
-		Success bool                 `json:"success"`
-		Result  PortForwardingConfig `json:"result"`
-	}
-	_ = json.Unmarshal(raw, &result)
-	if !result.Success {
-		// If rule not found, Terraform should drop it from state
+	id := state.ID.ValueInt64()
+	if id == 0 {
+		// nothing to read
 		resp.State.RemoveResource(ctx)
 		return
 	}
 
-	state.Enabled = types.BoolValue(result.Result.Enabled)
-	state.IpProto = types.StringValue(result.Result.IpProto)
-	state.WanPortStart = types.Int64Value(int64(result.Result.WanPortStart))
-	state.WanPortEnd = types.Int64Value(int64(result.Result.WanPortEnd))
-	state.LanIP = types.StringValue(result.Result.LanIP)
-	state.LanPort = types.Int64Value(int64(result.Result.LanPort))
-	state.SrcIP = types.StringValue(result.Result.SrcIP)
-	state.Comment = types.StringValue(result.Result.Comment)
-	state.Hostname = types.StringValue(result.Result.Hostname)
-
-	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
-}
-
-func (r *PortForwardingResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	var plan PortForwardingModel
-	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
-	if resp.Diagnostics.HasError() {
-		return
-	}
-
-	id := plan.ID.ValueInt64()
-	url := fmt.Sprintf("http://mafreebox.freebox.fr/api/v8/fw/redir/%d", id)
-
-	payload := map[string]interface{}{
-		"enabled":        plan.Enabled.ValueBool(),
-		"ip_proto":       plan.IpProto.ValueString(),
-		"wan_port_start": plan.WanPortStart.ValueInt64(),
-		"wan_port_end":   plan.WanPortEnd.ValueInt64(),
-		"lan_ip":         plan.LanIP.ValueString(),
-		"lan_port":       plan.LanPort.ValueInt64(),
-		"src_ip":         plan.SrcIP.ValueString(),
-		"comment":        plan.Comment.ValueString(),
-	}
-
-	body, _ := json.Marshal(payload)
-	res, err := fbClient.DoRequest(http.MethodPut, url, body)
+	path := fmt.Sprintf("/fw/redir/%d", id)
+	hreq, _ := r.client.newRequest(ctx, http.MethodGet, path, nil)
+	hres, err := r.client.http.Do(hreq)
 	if err != nil {
-		resp.Diagnostics.AddError("API error", fmt.Sprintf("Failed updating port forward: %s", err))
+		resp.Diagnostics.AddError("API error", err.Error())
 		return
 	}
-	defer res.Body.Close()
-	raw, _ := ioutil.ReadAll(res.Body)
+	defer hres.Body.Close()
 
-	var result struct {
-		Success bool                 `json:"success"`
-		Result  PortForwardingConfig `json:"result"`
+	if hres.StatusCode == http.StatusNotFound {
+		resp.State.RemoveResource(ctx)
+		return
 	}
-	_ = json.Unmarshal(raw, &result)
-	if !result.Success {
-		resp.Diagnostics.AddError("API error", fmt.Sprintf("Update failed: %s", string(raw)))
+	if hres.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(hres.Body)
+		resp.Diagnostics.AddError("API error", fmt.Sprintf("status %d: %s", hres.StatusCode, string(body)))
 		return
 	}
 
-	plan.Hostname = types.StringValue(result.Result.Hostname)
+	var env apiEnvelope[apiPortForward]
+	if err := json.NewDecoder(hres.Body).Decode(&env); err != nil {
+		resp.Diagnostics.AddError("Decode error", err.Error())
+		return
+	}
+	if !env.Success {
+		resp.Diagnostics.AddError("API error", env.Msg)
+		return
+	}
 
-	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
+	resp.Diagnostics.Append(resp.State.Set(ctx, toPFState(env.Result))...)
 }
 
-func (r *PortForwardingResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
-	var state PortForwardingModel
+func (r *portForwardResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	if r.client == nil {
+		resp.Diagnostics.AddError("Client not configured", "Provider client is nil")
+		return
+	}
+
+	var plan pfModel
+	var state pfModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	url := fmt.Sprintf("http://mafreebox.freebox.fr/api/v8/fw/redir/%d", state.ID.ValueInt64())
-	res, err := fbClient.DoRequest(http.MethodDelete, url, nil)
-	if err != nil {
-		resp.Diagnostics.AddError("API error", fmt.Sprintf("Failed deleting port forward: %s", err))
+	// Prefer ID from current state; fall back to plan if needed
+	id := state.ID.ValueInt64()
+	if id == 0 {
+		id = plan.ID.ValueInt64()
+	}
+	if id == 0 {
+		resp.Diagnostics.AddError("Invalid state", "Missing ID in state")
 		return
 	}
-	defer res.Body.Close()
 
-	// Remove from state
-	resp.State.RemoveResource(ctx)
+	// Include ID in payload so it matches the URL (the API validates this)
+	payload := apiPortForward{
+		ID:           int(id),
+		Enabled:      plan.Enabled.ValueBool(),
+		IpProto:      plan.IpProto.ValueString(),
+		WanPortStart: int(plan.WanPortStart.ValueInt64()),
+		WanPortEnd:   int(plan.WanPortEnd.ValueInt64()),
+		LanIP:        plan.LanIP.ValueString(),
+		LanPort:      int(plan.LanPort.ValueInt64()),
+		SrcIP:        plan.SrcIP.ValueString(),
+		Comment:      plan.Comment.ValueString(),
+	}
+	b, _ := json.Marshal(payload)
+
+	path := fmt.Sprintf("/fw/redir/%d", id)
+	hreq, _ := r.client.newRequest(ctx, http.MethodPut, path, bytes.NewBuffer(b))
+	hres, err := r.client.http.Do(hreq)
+	if err != nil {
+		resp.Diagnostics.AddError("API error", err.Error())
+		return
+	}
+	defer hres.Body.Close()
+
+	var env apiEnvelope[apiPortForward]
+	_ = json.NewDecoder(hres.Body).Decode(&env)
+	if hres.StatusCode != http.StatusOK || !env.Success {
+		resp.Diagnostics.AddError("API error", fmt.Sprintf("update failed: status %d, msg=%s, code=%s", hres.StatusCode, env.Msg, env.ErrorCode))
+		return
+	}
+
+	resp.Diagnostics.Append(resp.State.Set(ctx, toPFState(env.Result))...)
+}
+
+func (r *portForwardResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
+	if r.client == nil {
+		resp.Diagnostics.AddError("Client not configured", "Provider client is nil")
+		return
+	}
+
+	var id types.Int64
+	resp.Diagnostics.Append(req.State.GetAttribute(ctx, path.Root("id"), &id)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if id.IsNull() || id.ValueInt64() == 0 {
+		return
+	}
+
+	path := fmt.Sprintf("/fw/redir/%d", id.ValueInt64())
+	hreq, _ := r.client.newRequest(ctx, http.MethodDelete, path, nil)
+	hres, err := r.client.http.Do(hreq)
+	if err != nil {
+		resp.Diagnostics.AddError("API error", err.Error())
+		return
+	}
+	defer hres.Body.Close()
+
+	// Freebox typically returns 200 OK; accept 204 too
+	if hres.StatusCode != http.StatusOK && hres.StatusCode != http.StatusNoContent {
+		body, _ := io.ReadAll(hres.Body)
+		resp.Diagnostics.AddError("API error", fmt.Sprintf("status %d: %s", hres.StatusCode, string(body)))
+		return
+	}
+}
+
+// Import by id
+func (r *portForwardResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), req.ID)...)
+}
+
+// ---------- helpers ----------
+
+func toPFState(p apiPortForward) *pfModel {
+	return &pfModel{
+		ID:           types.Int64Value(int64(p.ID)),
+		Enabled:      types.BoolValue(p.Enabled),
+		IpProto:      types.StringValue(p.IpProto),
+		WanPortStart: types.Int64Value(int64(p.WanPortStart)),
+		WanPortEnd:   types.Int64Value(int64(p.WanPortEnd)),
+		LanIP:        types.StringValue(p.LanIP),
+		LanPort:      types.Int64Value(int64(p.LanPort)),
+		SrcIP:        stringOrNull(p.SrcIP),
+		Comment:      stringOrNull(p.Comment),
+		Hostname:     stringOrNull(p.Hostname),
+	}
 }

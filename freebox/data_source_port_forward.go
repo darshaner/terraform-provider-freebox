@@ -4,17 +4,28 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
-	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
+	dschema "github.com/hashicorp/terraform-plugin-framework/datasource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
-type PortForwardingsDataSource struct{}
+// Ensure interface compliance
+var (
+	_ datasource.DataSource              = &portForwardsDataSource{}
+	_ datasource.DataSourceWithConfigure = &portForwardsDataSource{}
+)
 
-type PortForwardingData struct {
+// Constructor
+func NewPortForwardingsDataSource() datasource.DataSource { return &portForwardsDataSource{} }
+
+// Data source
+type portForwardsDataSource struct{ client *Client }
+
+// TF models
+type pfItemOut struct {
 	ID           types.Int64  `tfsdk:"id"`
 	Enabled      types.Bool   `tfsdk:"enabled"`
 	IpProto      types.String `tfsdk:"ip_proto"`
@@ -27,35 +38,38 @@ type PortForwardingData struct {
 	Hostname     types.String `tfsdk:"hostname"`
 }
 
-type PortForwardingsModel struct {
-	Forwards []PortForwardingData `tfsdk:"forwards"`
+type pfDSModel struct {
+	Id       types.String `tfsdk:"id"`
+	Forwards []pfItemOut  `tfsdk:"forwards"`
 }
 
-func NewPortForwardingsDataSource() datasource.DataSource {
-	return &PortForwardingsDataSource{}
+func (d *portForwardsDataSource) Metadata(_ context.Context, _ datasource.MetadataRequest, resp *datasource.MetadataResponse) {
+	resp.TypeName = "freebox_port_forwardings"
 }
 
-func (d *PortForwardingsDataSource) Metadata(_ context.Context, req datasource.MetadataRequest, resp *datasource.MetadataResponse) {
-	resp.TypeName = req.ProviderTypeName + "_port_forwardings"
-}
-
-func (d *PortForwardingsDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, resp *datasource.SchemaResponse) {
-	resp.Schema = schema.Schema{
-		Attributes: map[string]schema.Attribute{
-			"forwards": schema.ListNestedAttribute{
-				Computed: true,
-				NestedObject: schema.NestedAttributeObject{
-					Attributes: map[string]schema.Attribute{
-						"id":             schema.Int64Attribute{Computed: true},
-						"enabled":        schema.BoolAttribute{Computed: true},
-						"ip_proto":       schema.StringAttribute{Computed: true},
-						"wan_port_start": schema.Int64Attribute{Computed: true},
-						"wan_port_end":   schema.Int64Attribute{Computed: true},
-						"lan_ip":         schema.StringAttribute{Computed: true},
-						"lan_port":       schema.Int64Attribute{Computed: true},
-						"src_ip":         schema.StringAttribute{Computed: true},
-						"comment":        schema.StringAttribute{Computed: true},
-						"hostname":       schema.StringAttribute{Computed: true},
+func (d *portForwardsDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, resp *datasource.SchemaResponse) {
+	resp.Schema = dschema.Schema{
+		Description: "List all Freebox port forwarding rules (fw/redir).",
+		Attributes: map[string]dschema.Attribute{
+			"id": dschema.StringAttribute{
+				Computed:    true,
+				Description: "Synthetic ID for this data source.",
+			},
+			"forwards": dschema.ListNestedAttribute{
+				Computed:    true,
+				Description: "All port forwarding rules.",
+				NestedObject: dschema.NestedAttributeObject{
+					Attributes: map[string]dschema.Attribute{
+						"id":             dschema.Int64Attribute{Computed: true, Description: "Rule ID."},
+						"enabled":        dschema.BoolAttribute{Computed: true},
+						"ip_proto":       dschema.StringAttribute{Computed: true},
+						"wan_port_start": dschema.Int64Attribute{Computed: true},
+						"wan_port_end":   dschema.Int64Attribute{Computed: true},
+						"lan_ip":         dschema.StringAttribute{Computed: true},
+						"lan_port":       dschema.Int64Attribute{Computed: true},
+						"src_ip":         dschema.StringAttribute{Computed: true},
+						"comment":        dschema.StringAttribute{Computed: true},
+						"hostname":       dschema.StringAttribute{Computed: true},
 					},
 				},
 			},
@@ -63,29 +77,47 @@ func (d *PortForwardingsDataSource) Schema(_ context.Context, _ datasource.Schem
 	}
 }
 
-func (d *PortForwardingsDataSource) Read(ctx context.Context, req datasource.ReadRequest, resp *datasource.ReadResponse) {
-	url := "http://mafreebox.freebox.fr/api/v8/fw/redir/"
-	res, err := fbClient.DoRequest(http.MethodGet, url, nil)
+func (d *portForwardsDataSource) Configure(_ context.Context, req datasource.ConfigureRequest, _ *datasource.ConfigureResponse) {
+	if req.ProviderData != nil {
+		d.client = req.ProviderData.(*Client)
+	}
+}
+
+func (d *portForwardsDataSource) Read(ctx context.Context, _ datasource.ReadRequest, resp *datasource.ReadResponse) {
+	if d.client == nil {
+		resp.Diagnostics.AddError("Client not configured", "Provider client is nil")
+		return
+	}
+
+	// GET /fw/redir/
+	hreq, _ := d.client.newRequest(ctx, http.MethodGet, "/fw/redir/", nil)
+	hres, err := d.client.http.Do(hreq)
 	if err != nil {
-		resp.Diagnostics.AddError("API error", fmt.Sprintf("Failed to fetch port forwardings: %s", err))
+		resp.Diagnostics.AddError("API error", err.Error())
 		return
 	}
-	defer res.Body.Close()
-	raw, _ := ioutil.ReadAll(res.Body)
+	defer hres.Body.Close()
 
-	var result struct {
-		Success bool                   `json:"success"`
-		Result  []PortForwardingConfig `json:"result"`
-	}
-	_ = json.Unmarshal(raw, &result)
-	if !result.Success {
-		resp.Diagnostics.AddError("API error", fmt.Sprintf("Failed: %s", string(raw)))
+	if hres.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(hres.Body)
+		resp.Diagnostics.AddError("API error", fmt.Sprintf("status %d: %s", hres.StatusCode, string(body)))
 		return
 	}
 
-	var forwards []PortForwardingData
-	for _, pf := range result.Result {
-		forwards = append(forwards, PortForwardingData{
+	var env apiEnvelope[[]apiPortForward]
+	if err := json.NewDecoder(hres.Body).Decode(&env); err != nil {
+		resp.Diagnostics.AddError("Decode error", err.Error())
+		return
+	}
+	if !env.Success {
+		resp.Diagnostics.AddError("API error", env.Msg)
+		return
+	}
+
+	out := pfDSModel{Id: types.StringValue("port_forwardings")}
+	out.Forwards = make([]pfItemOut, 0, len(env.Result))
+	for _, pf := range env.Result {
+		out.Forwards = append(out.Forwards, pfItemOut{
 			ID:           types.Int64Value(int64(pf.ID)),
 			Enabled:      types.BoolValue(pf.Enabled),
 			IpProto:      types.StringValue(pf.IpProto),
@@ -93,13 +125,11 @@ func (d *PortForwardingsDataSource) Read(ctx context.Context, req datasource.Rea
 			WanPortEnd:   types.Int64Value(int64(pf.WanPortEnd)),
 			LanIP:        types.StringValue(pf.LanIP),
 			LanPort:      types.Int64Value(int64(pf.LanPort)),
-			SrcIP:        types.StringValue(pf.SrcIP),
-			Comment:      types.StringValue(pf.Comment),
-			Hostname:     types.StringValue(pf.Hostname),
+			SrcIP:        stringOrNull(pf.SrcIP),
+			Comment:      stringOrNull(pf.Comment),
+			Hostname:     stringOrNull(pf.Hostname),
 		})
 	}
 
-	state := PortForwardingsModel{Forwards: forwards}
-	diags := resp.State.Set(ctx, &state)
-	resp.Diagnostics.Append(diags...)
+	resp.Diagnostics.Append(resp.State.Set(ctx, &out)...)
 }
